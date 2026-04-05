@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use state::AppState;
 use tauri::Manager;
-use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
 pub fn run() {
     tracing_subscriber::fmt()
@@ -26,8 +26,8 @@ pub fn run() {
             let _tray = TrayIconBuilder::with_id("main_tray")
                 .icon(active_icon)
                 .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click { button, .. } = event {
-                        if button == MouseButton::Left {
+                    if let TrayIconEvent::Click { button, button_state, .. } = event {
+                        if button == MouseButton::Left && button_state == MouseButtonState::Up {
                             if let Some(window) = tray.app_handle().get_webview_window("main") {
                                 let visible = window.is_visible().unwrap_or(false);
                                 let minimized = window.is_minimized().unwrap_or(false);
