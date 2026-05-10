@@ -47,8 +47,12 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src-tauri/Cargo.toml src-tauri/Cargo.lock package.json src-tauri/tauri.conf.json
           git commit -m "chore: release v${{ steps.bump.outputs.version }}"
-          git tag "v${{ steps.bump.outputs.version }}"
-          git push origin main --follow-tags
+          # Annotated tag so it carries metadata + reliably pushes
+          git tag -a "v${{ steps.bump.outputs.version }}" -m "Release v${{ steps.bump.outputs.version }}"
+          # Push branch and tag separately — `--follow-tags` ignores lightweight
+          # tags and can fail silently for fresh tags, so we don't rely on it
+          git push origin main
+          git push origin "v${{ steps.bump.outputs.version }}"
 
   build-macos:
     needs: bump
