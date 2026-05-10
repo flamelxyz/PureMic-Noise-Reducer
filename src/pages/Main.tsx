@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@/lib/tauri";
+import { loadSettings, patchSettings } from "@/lib/settings";
 import { useMicrophones } from "@/hooks/useMicrophones";
 import { useOutputDevices } from "@/hooks/useOutputDevices";
 import { useAudio } from "@/hooks/useAudio";
@@ -11,31 +12,48 @@ import { DriverSetup } from "@/components/DriverSetup";
 import { SettingsModal } from "@/components/SettingsModal";
 import { VoicePoweredOrb } from "@/components/VoicePoweredOrb";
 import { EQPanel } from "@/components/EQPanel";
+import { PresetMenu } from "@/components/PresetMenu";
+import type { AudioPreset } from "@/lib/presets";
 import { ShieldCheck, Settings2, Loader2, Lock, Headphones, Mic, RefreshCw } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { Card, CardContent } from "@/components/ui/card";
 import appLogo from "@/assets/menuBar.png";
 
 export function Main() {
-  const mics = useMicrophones();
-  const outputs = useOutputDevices();
+  // Read persisted settings synchronously so device hooks and state can
+  // initialise with the user's previous choices on first render.
+  const initialSettings = useRef(loadSettings()).current;
+
+  const mics = useMicrophones(initialSettings.micId);
+  const outputs = useOutputDevices(initialSettings.outputId);
   const audio = useAudio();
-  const levels = useAudioLevel(audio.pipelineRunning);
+  const level = useAudioLevel(audio.pipelineRunning);
 
   const [ncEnabled, setNcEnabled] = useState(false);
   const [monitoringEnabled, setMonitoringEnabled] = useState(false);
-  const [inputGain, setInputGain] = useState(1.0);
-  const [outputGain, setOutputGain] = useState(1.0);
+  const [inputGain, setInputGain] = useState(initialSettings.inputGain);
+  const [outputGain, setOutputGain] = useState(initialSettings.outputGain);
   const [virtualDevice, setVirtualDevice] = useState<string | null>(null);
   const [driverInstalled, setDriverInstalled] = useState<boolean | null>(null);
   const [platform, setPlatform] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [eqOpen, setEqOpen] = useState(false);
-  const [eqEnabled, setEqEnabled] = useState(true);
+  const [eqEnabled, setEqEnabled] = useState(initialSettings.eqEnabled);
   const [isDriverInstalling, setIsDriverInstalling] = useState(false);
 
   useEffect(() => {
-    invoke<boolean>("get_eq_enabled").then(setEqEnabled).catch(() => { });
+    // Re-apply persisted audio config to the backend atomics on every launch
+    // (the Rust side resets these on process start).
+    invoke("set_input_gain", { gain: initialSettings.inputGain }).catch(() => { });
+    invoke("set_output_gain", { gain: initialSettings.outputGain }).catch(() => { });
+    invoke("set_eq_enabled", { enabled: initialSettings.eqEnabled }).catch(() => { });
+    invoke("set_eq_bands", {
+      bass: initialSettings.eqBass,
+      mid: initialSettings.eqMid,
+      treble: initialSettings.eqTreble,
+    }).catch(() => { });
+    audio.setHardModeEnabled(initialSettings.hardMode);
+
     invoke<string>("get_platform").then(setPlatform).catch(() => { });
     invoke<boolean>("is_driver_installed")
       .then((installed) => {
@@ -49,6 +67,24 @@ export function Main() {
         setDriverInstalled(false);
       });
   }, []);
+
+  // Auto-refresh device lists when the window regains focus or becomes
+  // visible (e.g. user plugged in headphones while the app was in the tray).
+  useEffect(() => {
+    const refresh = () => {
+      mics.refresh();
+      outputs.refresh();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [mics.refresh, outputs.refresh]);
 
   const handleNcToggle = async (next: boolean) => {
     setNcEnabled(next);
@@ -81,8 +117,14 @@ export function Main() {
     }
   };
 
+  const handleMicSelect = async (id: string) => {
+    await mics.selectMic(id);
+    patchSettings({ micId: id });
+  };
+
   const handleOutputSelect = async (id: string) => {
     outputs.selectOutput(id);
+    patchSettings({ outputId: id });
     if (audio.pipelineRunning && monitoringEnabled) {
       await audio.startPipeline(mics.selected, id, ncEnabled, virtualDevice);
     }
@@ -91,11 +133,55 @@ export function Main() {
   const handleInputGain = (v: number) => {
     setInputGain(v);
     audio.setInputGain(v);
+    patchSettings({ inputGain: v });
   };
 
   const handleOutputGain = (v: number) => {
     setOutputGain(v);
     audio.setOutputGain(v);
+    patchSettings({ outputGain: v });
+  };
+
+  const handleHardModeToggle = (next: boolean) => {
+    audio.setHardModeEnabled(next);
+    patchSettings({ hardMode: next });
+  };
+
+  const buildCurrentPreset = (): AudioPreset => {
+    const s = loadSettings();
+    return {
+      inputGain,
+      outputGain,
+      eqEnabled,
+      eqBass: s.eqBass,
+      eqMid: s.eqMid,
+      eqTreble: s.eqTreble,
+      hardMode: audio.hardMode,
+    };
+  };
+
+  const handleApplyPreset = async (preset: AudioPreset) => {
+    setInputGain(preset.inputGain);
+    setOutputGain(preset.outputGain);
+    setEqEnabled(preset.eqEnabled);
+    audio.setInputGain(preset.inputGain);
+    audio.setOutputGain(preset.outputGain);
+    audio.setHardModeEnabled(preset.hardMode);
+    invoke("set_eq_enabled", { enabled: preset.eqEnabled }).catch(() => { });
+    invoke("set_eq_bands", {
+      bass: preset.eqBass,
+      mid: preset.eqMid,
+      treble: preset.eqTreble,
+    }).catch(() => { });
+    patchSettings({
+      inputGain: preset.inputGain,
+      outputGain: preset.outputGain,
+      eqEnabled: preset.eqEnabled,
+      eqBass: preset.eqBass,
+      eqMid: preset.eqMid,
+      eqTreble: preset.eqTreble,
+      hardMode: preset.hardMode,
+    });
   };
 
   // Loading state
@@ -234,6 +320,10 @@ export function Main() {
           >
             EQ
           </button>
+          <PresetMenu
+            currentPreset={buildCurrentPreset()}
+            onApply={handleApplyPreset}
+          />
           <button
             type="button"
             onClick={() => setSettingsOpen(true)}
@@ -254,7 +344,7 @@ export function Main() {
               <div className="w-[240px] h-[240px] opacity-80">
                 <VoicePoweredOrb
                   active={audio.pipelineRunning}
-                  level={levels[levels.length - 1]}
+                  level={level}
                   hue={ncEnabled ? 160 : 260}
                   voiceSensitivity={1.5}
                 />
@@ -302,7 +392,7 @@ export function Main() {
                 devices={mics.devices}
                 selected={mics.selected}
                 loading={mics.loading}
-                onSelect={mics.selectMic}
+                onSelect={handleMicSelect}
               />
             </div>
 
@@ -323,7 +413,7 @@ export function Main() {
               </div>
               <Switch
                 checked={audio.hardMode}
-                onCheckedChange={audio.setHardModeEnabled}
+                onCheckedChange={handleHardModeToggle}
                 disabled={!ncEnabled || audio.busy}
                 className="data-[state=checked]:bg-red-500"
               />

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@/lib/tauri";
+import { patchSettings } from "@/lib/settings";
 import { X, RotateCcw } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 
@@ -38,6 +39,7 @@ export function EQPanel({ open, enabled, onEnabledChange, onClose }: Props) {
       const next = { ...bands, [key]: value };
       setBands(next);
       invoke("set_eq_bands", { bass: next.bass, mid: next.mid, treble: next.treble }).catch(console.error);
+      patchSettings({ eqBass: next.bass, eqMid: next.mid, eqTreble: next.treble });
     },
     [bands]
   );
@@ -45,6 +47,7 @@ export function EQPanel({ open, enabled, onEnabledChange, onClose }: Props) {
   const resetAll = useCallback(() => {
     setBands(DEFAULTS);
     invoke("set_eq_bands", { bass: DEFAULTS.bass, mid: DEFAULTS.mid, treble: DEFAULTS.treble }).catch(console.error);
+    patchSettings({ eqBass: DEFAULTS.bass, eqMid: DEFAULTS.mid, eqTreble: DEFAULTS.treble });
   }, []);
 
   if (!open) return null;
@@ -66,6 +69,7 @@ export function EQPanel({ open, enabled, onEnabledChange, onClose }: Props) {
               onCheckedChange={(v) => {
                 onEnabledChange(v);
                 invoke("set_eq_enabled", { enabled: v }).catch(console.error);
+                patchSettings({ eqEnabled: v });
               }}
               className="data-[state=checked]:bg-emerald-500"
             />

@@ -13,7 +13,7 @@ use cpal::{Device, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
-    Arc, Mutex,
+    Mutex,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -174,43 +174,88 @@ impl AudioPipeline {
             // Larger buffers cause latency buildup = metallic/phaser sound.
             let rb = ringbuf::HeapRb::<f32>::new(FRAME_SIZE * 8);
             let (prod, mut cons) = rb.split();
+            let ring_capacity = cons.capacity().get();
 
             let is_monitor = label == "Monitor";
+            let label_str = label.to_string();
 
             // Pre-allocate temp buffer outside the closure
             let out_frames_max = 8192; // generous upper bound
             let mut temp = vec![0f32; out_frames_max];
 
+            // Diagnostic counters — emitted as a periodic stats line every ~5s
+            let mut skip_count: u64 = 0;
+            let mut skip_samples: u64 = 0;
+            let mut underrun_count: u64 = 0;
+            let mut underrun_samples: u64 = 0;
+            let mut max_fill: usize = 0;
+            let mut min_fill: usize = usize::MAX;
+            let mut samples_consumed: u64 = 0;
+            let log_threshold: u64 = (rate * 5.0) as u64;
+
             let stream = device.build_output_stream(
                 &cfg,
                 move |data: &mut [f32], _| {
                     if ACTIVE_PIPELINE_ID.load(Ordering::SeqCst) != my_id {
-                        for s in data.iter_mut() { *s = 0.0; }
+                        data.fill(0.0);
                         return;
                     }
                     let gain = if is_monitor { load_gain(&OUTPUT_GAIN) } else { 1.0 };
                     let frames = data.len() / channels;
 
+                    let buffered = cons.occupied_len();
+                    if buffered > max_fill { max_fill = buffered; }
+                    if buffered < min_fill { min_fill = buffered; }
+
                     // Anti-latency: if ring buffer has way more data than we need,
                     // skip ahead to stay near real-time. This prevents the
                     // "metallic/phaser" effect caused by growing delay.
-                    let buffered = cons.occupied_len();
                     let max_buffered = FRAME_SIZE * 4; // ~40ms max
                     if buffered > max_buffered + frames {
                         let skip = buffered - max_buffered;
-                        let mut discard = vec![0f32; skip];
-                        cons.pop_slice(&mut discard);
+                        cons.skip(skip);
+                        skip_count += 1;
+                        skip_samples += skip as u64;
                     }
 
                     if frames > temp.len() {
                         temp.resize(frames, 0.0);
                     }
                     let read = cons.pop_slice(&mut temp[..frames]);
+                    if read < frames {
+                        // Underrun: not enough data, output silence for missing samples
+                        underrun_count += 1;
+                        underrun_samples += (frames - read) as u64;
+                    }
                     for (i, ch_frame) in data.chunks_mut(channels).enumerate() {
                         let s = if i < read { temp[i] * gain } else { 0.0 };
                         for ch in ch_frame.iter_mut() {
                             *ch = s;
                         }
+                    }
+
+                    samples_consumed += frames as u64;
+                    if samples_consumed >= log_threshold {
+                        tracing::info!(
+                            "[{label} @{rate:.0}Hz] consumed={consumed}, fill: min={min}/max={max}/cap={cap}, skips={sk_n}({sk_s} samp), underruns={ur_n}({ur_s} samp)",
+                            label = label_str,
+                            rate = rate,
+                            consumed = samples_consumed,
+                            min = if min_fill == usize::MAX { 0 } else { min_fill },
+                            max = max_fill,
+                            cap = ring_capacity,
+                            sk_n = skip_count,
+                            sk_s = skip_samples,
+                            ur_n = underrun_count,
+                            ur_s = underrun_samples,
+                        );
+                        samples_consumed = 0;
+                        skip_count = 0;
+                        skip_samples = 0;
+                        underrun_count = 0;
+                        underrun_samples = 0;
+                        max_fill = 0;
+                        min_fill = usize::MAX;
                     }
                 },
                 |err| tracing::error!("Output error: {err}"),
@@ -251,8 +296,15 @@ impl AudioPipeline {
             None => (None, None),
         };
 
+        // Capture output rates for the startup summary log (before the producers
+        // are moved into the input callback closure).
+        let virt_rate_str = virt_prod.as_ref().map(|(r, _)| format!("{:.0}Hz", r)).unwrap_or_else(|| "—".into());
+        let mon_rate_str = mon_prod.as_ref().map(|(r, _)| format!("{:.0}Hz", r)).unwrap_or_else(|| "—".into());
+
         // ── Input callback ───────────────────────────────────────────────────
-        let denoiser = Arc::new(Mutex::new(Denoiser::new()));
+        // Owned by the closure (single-thread access on the audio callback thread)
+        // — no Arc/Mutex needed. Locking inside the real-time path was pure overhead.
+        let mut denoiser = Denoiser::new();
         let mut warmth_eq = WarmthEQ::new(rnnoise_rate);
 
         // Use a fixed ring-style accumulator to avoid unbounded Vec growth.
@@ -267,10 +319,29 @@ impl AudioPipeline {
         let log_every = (rnnoise_rate * 5.0) as usize;
         let app_clone = app.clone();
 
-        // Smoothing state for "Hard Reduce" noise gate
-        let mut hard_gate_gain = 1.0f32;
+        // Diagnostic counters for the input side — emitted every ~5s of audio
+        let mut drain_count: u64 = 0;
+        let mut drain_samples: u64 = 0;
+        let mut virt_drop_count: u64 = 0;
+        let mut virt_drop_samples: u64 = 0;
+        let mut mon_drop_count: u64 = 0;
+        let mut mon_drop_samples: u64 = 0;
+        let mut total_input_samples: u64 = 0;
 
-        // Pre-allocated reusable buffers to avoid per-callback allocations
+        // "Hard Reduce" noise gate — proper expander with hysteresis + asymmetric envelope.
+        //
+        //   - Hysteresis: open at VAD>0.30, close at VAD<0.12 (prevents chattering)
+        //   - Fast attack (~10ms): opens quickly on voice onset, no syllable cutoff
+        //   - Slow release (~250ms): closes gradually, no pumping between words
+        //   - Floor 0.35 (-9dB): gentle ducking, never feels "drowned"
+        let mut hard_gate_gain = 1.0f32;
+        let mut hard_gate_open = true;
+
+        // Pre-allocated reusable buffers — avoid per-callback heap allocations
+        // on the real-time audio thread (allocator contention can cause glitches).
+        let needs_input_resample = (in_rate - rnnoise_rate).abs() >= 1.0;
+        let mut mono_buf: Vec<f32> = Vec::with_capacity(FRAME_SIZE * 2);
+        let mut at_48k_buf: Vec<f32> = Vec::with_capacity(FRAME_SIZE * 2);
         let mut resample_buf: Vec<f32> = Vec::with_capacity(FRAME_SIZE * 2);
 
         let input_stream = input_device.build_input_stream(
@@ -282,21 +353,24 @@ impl AudioPipeline {
                 let i_gain = load_gain(&INPUT_GAIN);
                 let denoise = DENOISE_ENABLED.load(Ordering::Relaxed);
 
-                // 1. Downmix to mono + input gain
-                let mono: Vec<f32> = data
-                    .chunks(in_channels)
-                    .map(|ch| (ch.iter().sum::<f32>() / in_channels as f32) * i_gain)
-                    .collect();
+                // 1. Downmix to mono + input gain (reuse buffer)
+                mono_buf.clear();
+                mono_buf.extend(
+                    data.chunks(in_channels)
+                        .map(|ch| (ch.iter().sum::<f32>() / in_channels as f32) * i_gain),
+                );
 
-                // 2. Resample to 48 kHz
-                let at_48k = if (in_rate - rnnoise_rate).abs() < 1.0 {
-                    mono
+                // 2. Resample to 48 kHz (reuse buffer; skip copy when rates match)
+                let at_48k: &[f32] = if needs_input_resample {
+                    at_48k_buf.clear();
+                    resample_into(&mono_buf, in_rate, rnnoise_rate, &mut at_48k_buf);
+                    &at_48k_buf
                 } else {
-                    resample_linear(&mono, in_rate, rnnoise_rate)
+                    &mono_buf
                 };
 
                 // 3. RMS for visualizer (pre-denoise)
-                for &s in &at_48k {
+                for &s in at_48k {
                     level_accum += s * s;
                     level_count += 1;
                 }
@@ -308,22 +382,43 @@ impl AudioPipeline {
                     level_count = 0;
                 }
 
+                total_input_samples += data.len() as u64;
                 frames_processed += at_48k.len();
                 if frames_processed >= log_every {
-                    tracing::info!("Audio engine heartbeat: processed {} samples", frames_processed);
+                    tracing::info!(
+                        "[INPUT @{in_rate:.0}Hz→48k resample={resamp}] in={ins} samp, processed={proc} samp, drains={dn}({ds} samp), virt_drops={vn}({vs} samp), mon_drops={mn}({ms} samp)",
+                        in_rate = in_rate,
+                        resamp = needs_input_resample,
+                        ins = total_input_samples,
+                        proc = frames_processed,
+                        dn = drain_count,
+                        ds = drain_samples,
+                        vn = virt_drop_count,
+                        vs = virt_drop_samples,
+                        mn = mon_drop_count,
+                        ms = mon_drop_samples,
+                    );
                     frames_processed = 0;
+                    total_input_samples = 0;
+                    drain_count = 0;
+                    drain_samples = 0;
+                    virt_drop_count = 0;
+                    virt_drop_samples = 0;
+                    mon_drop_count = 0;
+                    mon_drop_samples = 0;
                 }
 
                 // 4. Accumulate samples for FRAME_SIZE processing
-                accumulator.extend_from_slice(&at_48k);
+                accumulator.extend_from_slice(at_48k);
 
                 // Safety valve: if accumulator grows too large (consumer can't keep up),
                 // drop oldest samples to prevent unbounded latency buildup.
-                // This is the key fix for the "metallic sound over time" issue.
+                // (This is a symptom of clock drift; counted in diagnostics.)
                 if accumulator.len() > max_accum {
                     let excess = accumulator.len() - max_accum;
                     accumulator.drain(..excess);
-                    tracing::warn!("Accumulator overflow: dropped {} samples to prevent latency buildup", excess);
+                    drain_count += 1;
+                    drain_samples += excess as u64;
                 }
 
                 // Process complete frames
@@ -339,19 +434,32 @@ impl AudioPipeline {
                             *s *= 32768.0;
                         }
 
-                        let vad = denoiser.lock().unwrap().process_frame(&mut frame);
+                        let vad = denoiser.process_frame(&mut frame);
 
-                        // Hard mode: Aggressive VAD-based noise gate
+                        // Hard mode: VAD-driven expander with hysteresis + asymmetric envelope
                         let is_hard = DENOISE_HARD_MODE.load(Ordering::Relaxed);
                         if is_hard {
-                            let target_gain = if vad < 0.20 { 0.05 } else { 1.0 };
-                            hard_gate_gain = hard_gate_gain * 0.8 + target_gain * 0.2;
+                            // Hysteresis: stay in current state until threshold crossed cleanly
+                            if hard_gate_open {
+                                if vad < 0.12 { hard_gate_open = false; }
+                            } else {
+                                if vad > 0.30 { hard_gate_open = true; }
+                            }
+                            let target_gain: f32 = if hard_gate_open { 1.0 } else { 0.35 };
+
+                            // Asymmetric envelope: fast attack, slow release
+                            // alpha values for 10ms frame at 48kHz:
+                            //   attack 0.5 → ~10ms time constant (snappy onset)
+                            //   release 0.04 → ~250ms time constant (no pumping)
+                            let alpha = if target_gain > hard_gate_gain { 0.5 } else { 0.04 };
+                            hard_gate_gain = hard_gate_gain * (1.0 - alpha) + target_gain * alpha;
 
                             for s in frame.iter_mut() {
                                 *s *= hard_gate_gain;
                             }
                         } else {
                             hard_gate_gain = 1.0;
+                            hard_gate_open = true;
                         }
 
                         for s in frame.iter_mut() {
@@ -364,25 +472,35 @@ impl AudioPipeline {
                         }
                     }
 
-                    // 5a. Push to virtual device (drop oldest in ring buffer if full)
+                    // 5a. Push to virtual device — track silent drops on full ring
                     if let Some((vrate, ref mut prod)) = virt_prod {
-                        if (rnnoise_rate - vrate).abs() < 1.0 {
-                            let _ = prod.push_slice(&frame);
+                        let to_push: &[f32] = if (rnnoise_rate - vrate).abs() < 1.0 {
+                            &frame
                         } else {
                             resample_buf.clear();
                             resample_into(&frame, rnnoise_rate, vrate, &mut resample_buf);
-                            let _ = prod.push_slice(&resample_buf);
+                            &resample_buf
+                        };
+                        let pushed = prod.push_slice(to_push);
+                        if pushed < to_push.len() {
+                            virt_drop_count += 1;
+                            virt_drop_samples += (to_push.len() - pushed) as u64;
                         }
                     }
 
-                    // 5b. Push to monitoring output
+                    // 5b. Push to monitoring output — track silent drops on full ring
                     if let Some((mrate, ref mut prod)) = mon_prod {
-                        if (rnnoise_rate - mrate).abs() < 1.0 {
-                            let _ = prod.push_slice(&frame);
+                        let to_push: &[f32] = if (rnnoise_rate - mrate).abs() < 1.0 {
+                            &frame
                         } else {
                             resample_buf.clear();
                             resample_into(&frame, rnnoise_rate, mrate, &mut resample_buf);
-                            let _ = prod.push_slice(&resample_buf);
+                            &resample_buf
+                        };
+                        let pushed = prod.push_slice(to_push);
+                        if pushed < to_push.len() {
+                            mon_drop_count += 1;
+                            mon_drop_samples += (to_push.len() - pushed) as u64;
                         }
                     }
                 }
@@ -397,6 +515,11 @@ impl AudioPipeline {
         )?;
 
         input_stream.play()?;
+
+        tracing::info!(
+            "[PIPELINE] start — in={:.0}Hz (resample={}), virt={}, monitor={}",
+            in_rate, needs_input_resample, virt_rate_str, mon_rate_str,
+        );
 
         *PIPELINE.lock().unwrap() = Some(PipelineState {
             _input_stream: input_stream,
@@ -480,13 +603,6 @@ impl AudioPipeline {
                 .ok_or_else(|| anyhow!("Output device '{}' not found", id)),
         }
     }
-}
-
-/// Linear interpolation resampler (allocating version).
-fn resample_linear(input: &[f32], from_rate: f64, to_rate: f64) -> Vec<f32> {
-    let mut out = Vec::new();
-    resample_into(input, from_rate, to_rate, &mut out);
-    out
 }
 
 /// Linear interpolation resampler (non-allocating: appends to existing buffer).

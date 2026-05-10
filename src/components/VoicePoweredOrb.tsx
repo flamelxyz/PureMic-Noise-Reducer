@@ -24,7 +24,7 @@ export const VoicePoweredOrb: FC<VoicePoweredOrbProps> = ({
   maxHoverIntensity = 0.8,
 }) => {
   const ctnDom = useRef<HTMLDivElement>(null);
-  
+
   // Dynamic refs to avoid useEffect re-initialization on every frame
   const levelRef = useRef(level);
   const activeRef = useRef(active);
@@ -32,6 +32,10 @@ export const VoicePoweredOrb: FC<VoicePoweredOrbProps> = ({
   const voiceSensitivityRef = useRef(voiceSensitivity);
   const maxRotationSpeedRef = useRef(maxRotationSpeed);
   const maxHoverIntensityRef = useRef(maxHoverIntensity);
+
+  // RAF control — allow pausing when idle and restarting on activity
+  const rafIdRef = useRef<number>(0);
+  const updateRef = useRef<((t: number) => void) | null>(null);
 
   // Synchronize refs with props
   useEffect(() => { levelRef.current = level; }, [level]);
@@ -165,7 +169,6 @@ export const VoicePoweredOrb: FC<VoicePoweredOrbProps> = ({
 
     let rendererInstance: Renderer;
     let glContext: any;
-    let rafId: number;
     let program: Program;
     let lastTime = 0;
     let currentRot = 0;
@@ -230,8 +233,10 @@ export const VoicePoweredOrb: FC<VoicePoweredOrbProps> = ({
       resize();
 
       const update = (t: number) => {
-        rafId = requestAnimationFrame(update);
-        if (!program) return;
+        if (!program) {
+          rafIdRef.current = 0;
+          return;
+        }
 
         const dt = (t - lastTime) * 0.001;
         lastTime = t;
@@ -269,12 +274,25 @@ export const VoicePoweredOrb: FC<VoicePoweredOrbProps> = ({
 
         glContext.clear(glContext.COLOR_BUFFER_BIT | glContext.DEPTH_BUFFER_BIT);
         rendererInstance.render({ scene: mesh });
+
+        // Pause the loop when idle; activity effect below will restart it.
+        // We render one final inactive frame so the orb visually settles before stopping.
+        if (currentActive) {
+          rafIdRef.current = requestAnimationFrame(update);
+        } else {
+          rafIdRef.current = 0;
+        }
       };
 
-      rafId = requestAnimationFrame(update);
+      updateRef.current = update;
+      rafIdRef.current = requestAnimationFrame(update);
 
       return () => {
-        cancelAnimationFrame(rafId);
+        if (rafIdRef.current) {
+          cancelAnimationFrame(rafIdRef.current);
+          rafIdRef.current = 0;
+        }
+        updateRef.current = null;
         window.removeEventListener("resize", resize);
         resizeObserver.disconnect();
         if (container.contains(canvas)) { container.removeChild(canvas); }
@@ -285,6 +303,14 @@ export const VoicePoweredOrb: FC<VoicePoweredOrbProps> = ({
       return () => {};
     }
   }, []); // Only run ONCE to keep WebGL context stable
+
+  // Restart the RAF loop when the orb becomes active. The loop self-pauses
+  // when active is false to save GPU/CPU while the pipeline is idle.
+  useEffect(() => {
+    if (active && !rafIdRef.current && updateRef.current) {
+      rafIdRef.current = requestAnimationFrame(updateRef.current);
+    }
+  }, [active]);
 
   return (
     <div ref={ctnDom} className={cn("w-full h-full pointer-events-none", className)} />

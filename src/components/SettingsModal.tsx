@@ -1,6 +1,5 @@
 import { X, ShieldCheck, Loader2, RefreshCw, Trash2 } from "lucide-react";
 import { DriverSetup } from "./DriverSetup";
-import { Separator } from "./ui/separator";
 import { Badge } from "./ui/badge";
 import { cn } from "@/lib/utils";
 import { useState } from "react";
@@ -58,8 +57,8 @@ export function SettingsModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="w-full max-w-[420px] max-h-[90vh] overflow-y-auto bg-zinc-950 border border-white/10 rounded-2xl shadow-2xl animate-in zoom-in-95 fade-in-0 duration-200 no-scrollbar">
-        <div className="flex items-center justify-between px-4 py-3 border-b border-white/5 bg-white/5">
+      <div className="w-full max-w-[420px] bg-zinc-950 border border-white/10 rounded-2xl shadow-2xl animate-in zoom-in-95 fade-in-0 duration-200">
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/5 bg-white/5">
           <h2 className="text-sm font-bold tracking-tight">System Settings</h2>
           <button
             onClick={() => onOpenChange(false)}
@@ -69,18 +68,11 @@ export function SettingsModal({
           </button>
         </div>
 
-        <div className="p-4 flex flex-col gap-3">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="h-3.5 w-3.5 text-primary" />
-            <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground">
-              Driver Status
-            </span>
-            <Separator className="flex-1 bg-white/5" />
-          </div>
-
-          <div className="flex flex-col gap-2.5 p-3 rounded-xl bg-background/40 border border-white/5">
+        <div className="p-3 flex flex-col gap-2">
+          {/* Driver Status */}
+          <div className="flex flex-col gap-2 p-3 rounded-xl bg-background/40 border border-white/5">
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2.5">
                 <div
                   className={cn(
                     "p-1.5 rounded-md transition-colors",
@@ -89,11 +81,11 @@ export function SettingsModal({
                       : "bg-amber-500/20 text-amber-400"
                   )}
                 >
-                  <ShieldCheck className="h-4 w-4" />
+                  <ShieldCheck className="h-3.5 w-3.5" />
                 </div>
                 <div className="flex flex-col">
-                  <span className="text-sm font-bold tracking-tight">Core Audio Driver</span>
-                  <span className="text-[10px] text-muted-foreground/70 uppercase tracking-widest font-medium">
+                  <span className="text-xs font-bold tracking-tight">Core Audio Driver</span>
+                  <span className="text-[10px] text-muted-foreground/70 uppercase tracking-widest font-medium truncate max-w-[200px]">
                     {driverInstalled
                       ? virtualDevice
                         ? `Active: ${virtualDevice}`
@@ -122,44 +114,20 @@ export function SettingsModal({
               )}
             </div>
 
-            <div className="mt-3 pt-3 border-t border-white/5">
-              <div className="text-[11px] text-muted-foreground/80 mb-3 px-1">
-                Having issues with the virtual driver? You can re-install or repair it at any time.
-              </div>
+            {/* Install card only when driver missing — avoids redundant "Driver Required" UI */}
+            {!driverInstalled && (
               <DriverSetup
                 onInstalled={onInstalled}
                 onInstallStart={onInstallStart}
                 onInstallError={onInstallError}
               />
-            </div>
+            )}
           </div>
 
-          {/* Remove Driver */}
-          {driverInstalled && (
-            <div className="flex flex-col gap-2 p-3 rounded-xl bg-background/40 border border-white/5">
-              <div className="text-sm font-bold tracking-tight px-1">Remove Virtual Driver</div>
-              <p className="text-[11px] text-muted-foreground/60 italic px-1">
-                Uninstalls the virtual audio driver from your system. Do this before uninstalling PureMic.
-              </p>
-              {uninstallError && (
-                <div className="rounded-md bg-destructive/10 p-2 text-xs text-destructive">{uninstallError}</div>
-              )}
-              <button
-                type="button"
-                onClick={handleUninstall}
-                disabled={uninstalling}
-                className="flex items-center justify-center gap-2 w-full h-9 rounded-md bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 text-xs font-semibold transition-colors disabled:opacity-50"
-              >
-                {uninstalling ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
-                {uninstalling ? "Removing..." : "Remove Driver"}
-              </button>
-            </div>
-          )}
-
-          {/* Output Device Setting */}
+          {/* Loopback Device */}
           <div className="flex flex-col gap-2 p-3 rounded-xl bg-background/40 border border-white/5">
-            <div className="flex items-center justify-between px-1">
-              <div className="text-sm font-bold tracking-tight">Loopback Device</div>
+            <div className="flex items-center justify-between">
+              <div className="text-xs font-bold tracking-tight">Loopback Device</div>
               <button
                 type="button"
                 onClick={onRefreshOutputs}
@@ -170,9 +138,6 @@ export function SettingsModal({
                 <RefreshCw className={cn("h-3 w-3", loadingOutputs && "animate-spin")} />
               </button>
             </div>
-            <p className="text-[11px] text-muted-foreground/60 italic px-1 mb-1">
-              Select where to hear the processed audio signal when Loopback is ON.
-            </p>
             <OutputDeviceSelector
               devices={outputDevices}
               selected={selectedOutput}
@@ -180,6 +145,26 @@ export function SettingsModal({
               onSelect={onSelectOutput}
             />
           </div>
+
+          {/* Remove Driver */}
+          {driverInstalled && (
+            <div className="flex flex-col gap-2 p-3 rounded-xl bg-background/40 border border-white/5">
+              {uninstallError && (
+                <div className="rounded-md bg-destructive/10 p-2 text-[11px] text-destructive">
+                  {uninstallError}
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={handleUninstall}
+                disabled={uninstalling}
+                className="flex items-center justify-center gap-2 w-full h-8 rounded-md bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 text-[11px] font-semibold transition-colors disabled:opacity-50"
+              >
+                {uninstalling ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+                {uninstalling ? "Removing..." : "Remove Virtual Driver"}
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </div>
