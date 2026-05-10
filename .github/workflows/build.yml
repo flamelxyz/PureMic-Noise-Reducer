@@ -9,10 +9,54 @@ permissions:
   contents: write
 
 jobs:
+  bump:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump patch version
+        id: bump
+        run: |
+          CURRENT=$(grep -m1 '^version' src-tauri/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+          echo "Bumping $CURRENT → $NEW"
+
+          # Cargo.toml — only the [package] version (first ^version = "..." line)
+          sed -i "0,/^version = \"$CURRENT\"$/s//version = \"$NEW\"/" src-tauri/Cargo.toml
+
+          # Cargo.lock — version field within the puremic [[package]] entry
+          sed -i "/^name = \"puremic\"$/,/^version = /{ s/^version = \"$CURRENT\"$/version = \"$NEW\"/; }" src-tauri/Cargo.lock
+
+          # JSON files via jq
+          jq --arg v "$NEW" '.version = $v' package.json > package.json.tmp && mv package.json.tmp package.json
+          jq --arg v "$NEW" '.version = $v' src-tauri/tauri.conf.json > src-tauri/tauri.conf.json.tmp && mv src-tauri/tauri.conf.json.tmp src-tauri/tauri.conf.json
+
+          echo "version=$NEW" >> $GITHUB_OUTPUT
+          echo "tag=v$NEW" >> $GITHUB_OUTPUT
+
+      - name: Commit, tag, push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/Cargo.toml src-tauri/Cargo.lock package.json src-tauri/tauri.conf.json
+          git commit -m "chore: release v${{ steps.bump.outputs.version }}"
+          git tag "v${{ steps.bump.outputs.version }}"
+          git push origin main --follow-tags
+
   build-macos:
+    needs: bump
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
 
       - uses: actions/setup-node@v4
         with:
@@ -37,9 +81,12 @@ jobs:
           path: src-tauri/target/release/bundle/dmg/*.dmg
 
   build-windows:
+    needs: bump
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
 
       - uses: actions/setup-node@v4
         with:
@@ -64,7 +111,7 @@ jobs:
           path: src-tauri/target/release/bundle/nsis/*.exe
 
   release:
-    needs: [build-macos, build-windows]
+    needs: [bump, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Download macOS artifact
@@ -79,13 +126,13 @@ jobs:
           name: PureMic-Windows
           path: artifacts/windows
 
-      - name: Create or update latest release
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: Latest Build
+          tag_name: ${{ needs.bump.outputs.tag }}
+          name: PureMic ${{ needs.bump.outputs.tag }}
           body: |
-            Automatically built from the latest commit on `main`.
+            Automatic build from commit ${{ github.sha }}.
 
             **macOS:** Download the `.dmg` file
             **Windows:** Download the `.exe` installer
