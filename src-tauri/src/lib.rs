@@ -8,6 +8,11 @@ use tokio::sync::Mutex;
 use state::AppState;
 use tauri::Manager;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri_plugin_autostart::MacosLauncher;
+
+/// Argument passed by the OS when the app is launched automatically at login.
+/// When present, the main window stays hidden and the app lives in the tray.
+const MINIMIZED_ARG: &str = "--minimized";
 
 pub fn run() {
     tracing_subscriber::fmt()
@@ -19,6 +24,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec![MINIMIZED_ARG]),
+        ))
         .manage(Arc::new(Mutex::new(AppState::default())))
         .setup(|app| {
             // Setup Tray Icon
@@ -45,6 +54,18 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // The window is created hidden (see tauri.conf.json). Show it on a
+            // normal launch; when started by the OS at login (--minimized) keep
+            // it hidden so the app only appears in the system tray. The webview
+            // still loads, so the audio pipeline can auto-start in the background.
+            let start_minimized = std::env::args().any(|a| a == MINIMIZED_ARG);
+            if !start_minimized {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
 
             // Prevent window close, hide instead
             if let Some(window) = app.get_webview_window("main") {

@@ -1,6 +1,7 @@
-import { X, ShieldCheck, Loader2, RefreshCw, Trash2 } from "lucide-react";
+import { X, ShieldCheck, Loader2, RefreshCw, Trash2, Power, Zap } from "lucide-react";
 import { DriverSetup } from "./DriverSetup";
 import { Badge } from "./ui/badge";
+import { Switch } from "./ui/switch";
 import { cn } from "@/lib/utils";
 import { useState } from "react";
 import { invoke } from "@/lib/tauri";
@@ -20,6 +21,10 @@ interface SettingsModalProps {
   loadingOutputs: boolean;
   onSelectOutput: (id: string) => void;
   onRefreshOutputs?: () => void;
+  autostartEnabled: boolean;
+  onAutostartChange: (enabled: boolean) => void;
+  autoActivate: boolean;
+  onAutoActivateChange: (enabled: boolean) => void;
 }
 
 export function SettingsModal({
@@ -35,6 +40,10 @@ export function SettingsModal({
   loadingOutputs,
   onSelectOutput,
   onRefreshOutputs,
+  autostartEnabled,
+  onAutostartChange,
+  autoActivate,
+  onAutoActivateChange,
 }: SettingsModalProps) {
   const [uninstalling, setUninstalling] = useState(false);
   const [uninstallError, setUninstallError] = useState<string | null>(null);
@@ -122,6 +131,39 @@ export function SettingsModal({
                 onInstallError={onInstallError}
               />
             )}
+          </div>
+
+          {/* Startup */}
+          <div className="flex flex-col gap-3 p-3 rounded-xl bg-background/40 border border-white/5">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-1.5 rounded-md bg-primary/15 text-primary">
+                  <Power className="h-3.5 w-3.5" />
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-xs font-bold tracking-tight">Start with system</span>
+                  <span className="text-[10px] text-muted-foreground/70">
+                    Launch at login, minimized to the tray
+                  </span>
+                </div>
+              </div>
+              <Switch checked={autostartEnabled} onCheckedChange={onAutostartChange} />
+            </div>
+
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-1.5 rounded-md bg-primary/15 text-primary">
+                  <Zap className="h-3.5 w-3.5" />
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-xs font-bold tracking-tight">Activate on launch</span>
+                  <span className="text-[10px] text-muted-foreground/70">
+                    Turn noise reduction on automatically
+                  </span>
+                </div>
+              </div>
+              <Switch checked={autoActivate} onCheckedChange={onAutoActivateChange} />
+            </div>
           </div>
 
           {/* Loopback Device */}

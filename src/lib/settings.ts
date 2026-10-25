@@ -10,6 +10,10 @@ export interface PersistedSettings {
   eqMid: number;
   eqTreble: number;
   hardMode: boolean;
+  /** Turn noise reduction on automatically every time the app opens. */
+  autoActivate: boolean;
+  /** True once the "launch at login" default has been applied on first run. */
+  autostartInitialized: boolean;
 }
 
 export const DEFAULT_SETTINGS: PersistedSettings = {
@@ -22,6 +26,8 @@ export const DEFAULT_SETTINGS: PersistedSettings = {
   eqMid: 1.5,
   eqTreble: -2.5,
   hardMode: false,
+  autoActivate: true,
+  autostartInitialized: false,
 };
 
 function readRaw(): PersistedSettings {

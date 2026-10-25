@@ -20,6 +20,7 @@
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "center": true,
+        "visible": false,
         "additionalBrowserArgs": "--disable-gpu --disable-gpu-compositing"
       }
     ],

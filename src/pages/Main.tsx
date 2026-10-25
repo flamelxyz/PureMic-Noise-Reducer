@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@/lib/tauri";
 import { loadSettings, patchSettings } from "@/lib/settings";
+import { isAutostartEnabled, setAutostart } from "@/lib/autostart";
 import { useMicrophones } from "@/hooks/useMicrophones";
 import { useOutputDevices } from "@/hooks/useOutputDevices";
 import { useAudio } from "@/hooks/useAudio";
@@ -40,6 +41,16 @@ export function Main() {
   const [eqOpen, setEqOpen] = useState(false);
   const [eqEnabled, setEqEnabled] = useState(initialSettings.eqEnabled);
   const [isDriverInstalling, setIsDriverInstalling] = useState(false);
+  const [virtualChecked, setVirtualChecked] = useState(false);
+  const [autoActivate, setAutoActivate] = useState(initialSettings.autoActivate);
+  const [autostart, setAutostartState] = useState(false);
+
+  // Auto-activation bookkeeping: retry a few times because right after login
+  // the audio devices may not be ready yet.
+  const autoDone = useRef(!initialSettings.autoActivate);
+  const autoAttempts = useRef(0);
+  const AUTO_MAX_ATTEMPTS = 5;
+  const AUTO_RETRY_DELAY_MS = 3000;
 
   useEffect(() => {
     // Re-apply persisted audio config to the backend atomics on every launch
@@ -59,7 +70,11 @@ export function Main() {
       .then((installed) => {
         setDriverInstalled(installed);
         if (installed) {
-          audio.detectVirtualDevice().then(setVirtualDevice).catch(console.error);
+          audio
+            .detectVirtualDevice()
+            .then(setVirtualDevice)
+            .catch(console.error)
+            .finally(() => setVirtualChecked(true));
         }
       })
       .catch((err) => {
@@ -67,6 +82,52 @@ export function Main() {
         setDriverInstalled(false);
       });
   }, []);
+
+  // Launch at login: reflect the real OS state, and enable it by default the
+  // first time the app runs (only in release builds, so `tauri dev` never
+  // registers a debug binary).
+  useEffect(() => {
+    (async () => {
+      try {
+        if (import.meta.env.PROD && !loadSettings().autostartInitialized) {
+          await setAutostart(true);
+          patchSettings({ autostartInitialized: true });
+        }
+        setAutostartState(await isAutostartEnabled());
+      } catch (e) {
+        console.error("[autostart] init failed:", e);
+      }
+    })();
+  }, []);
+
+  // Turn noise reduction on automatically once everything is ready.
+  const autoReady =
+    platform !== null &&
+    driverInstalled === true &&
+    virtualChecked &&
+    !mics.loading &&
+    mics.selected !== null;
+
+  useEffect(() => {
+    if (autoDone.current) return;
+    if (audio.pipelineRunning) {
+      autoDone.current = true;
+      return;
+    }
+    if (!autoReady || audio.busy) return;
+    if (autoAttempts.current >= AUTO_MAX_ATTEMPTS) {
+      autoDone.current = true;
+      return;
+    }
+    const delay = autoAttempts.current === 0 ? 0 : AUTO_RETRY_DELAY_MS;
+    const timer = setTimeout(() => {
+      if (autoDone.current) return;
+      autoAttempts.current += 1;
+      setNcEnabled(true);
+      audio.startPipeline(mics.selected, null, true, virtualDevice);
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [autoReady, audio.busy, audio.pipelineRunning]);
 
   // Auto-refresh device lists when the window regains focus or becomes
   // visible (e.g. user plugged in headphones while the app was in the tray).
@@ -86,7 +147,24 @@ export function Main() {
     };
   }, [mics.refresh, outputs.refresh]);
 
+  const handleAutostartChange = async (next: boolean) => {
+    try {
+      await setAutostart(next);
+      setAutostartState(next);
+      patchSettings({ autostartInitialized: true });
+    } catch (e) {
+      console.error("[autostart] toggle failed:", e);
+    }
+  };
+
+  const handleAutoActivateChange = (next: boolean) => {
+    setAutoActivate(next);
+    patchSettings({ autoActivate: next });
+  };
+
   const handleNcToggle = async (next: boolean) => {
+    // A manual toggle always wins over the automatic start/retry logic.
+    autoDone.current = true;
     setNcEnabled(next);
     try {
       if (audio.pipelineRunning) {
@@ -236,7 +314,11 @@ export function Main() {
               onInstalled={() => {
                 setIsDriverInstalling(false);
                 setDriverInstalled(true);
-                audio.detectVirtualDevice().then(setVirtualDevice).catch(console.error);
+                audio
+                  .detectVirtualDevice()
+                  .then(setVirtualDevice)
+                  .catch(console.error)
+                  .finally(() => setVirtualChecked(true));
               }}
               onInstallStart={() => setIsDriverInstalling(true)}
               onInstallError={() => setIsDriverInstalling(false)}
@@ -286,6 +368,10 @@ export function Main() {
         loadingOutputs={outputs.loading}
         onSelectOutput={handleOutputSelect}
         onRefreshOutputs={outputs.refresh}
+        autostartEnabled={autostart}
+        onAutostartChange={handleAutostartChange}
+        autoActivate={autoActivate}
+        onAutoActivateChange={handleAutoActivateChange}
       />
 
       {/* macOS Custom TitleBar */}
